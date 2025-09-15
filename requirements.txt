@@ -1,2 +1,4 @@
 signal-bot-framework
 pytz
+slack_bolt
+aiohttp

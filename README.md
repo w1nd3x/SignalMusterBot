@@ -89,22 +89,24 @@ All commands should be sent as a **Direct Message** to the bot.
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | `/help`                             | Shows the list of available commands.                                                                   |
 | `/status [YYYY-MM-DD]`              | Checks your status for a given date. Defaults to the current day.                                       |
-| `/leave <start_date> [end_date]` | Adds a leave period for yourself. The end date is optional and defaults to the start date. Example: `/leave 2025-10-20 2025-10-24` |
+| `/leave <add\|remove> <start_date> [end_date]` | Adds a leave period for yourself. The end date is optional and defaults to the start date. Example: `/leave add 2025-10-20 2025-10-24` |
 
 ### Admin-Only Commands
 
 | Command                                                    | Description                                                                                                                              |
 | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `/status [@user] [date]`                                   | Checks the status of a mentioned user for a given date.                                                                                  |
+| `/status [user] [date]`                                   | Checks the status of a  user for today.                                                                                  |
 | `/config`                                                  | Displays the current bot configuration (check-in times, timezone, etc.).                                                                  |
 | `/config <key> <value>`                                    | Sets a configuration value. Example: `/config checkin_time 08:30`. This will automatically reschedule the bot's internal jobs.         |
 | `/holiday add <date> <desc>`                               | Adds a public holiday. Example: `/holiday add 2025-12-25 Christmas Day`                                                               |
 | `/holiday remove <date>`                                   | Removes a public holiday.                                                                                                                |
-| `/leave add [@user] <start> <end>`                         | Adds a leave period for the mentioned user.                                                                                              |
-| `/leave remove [@user] <start>`                            | Removes a leave period for the mentioned user that begins on the specified start date.                                                   |
-| `/muster [@user] <emoji> [details]`                        | Checks in on behalf of another user. Details are required for statuses like ⏱️. Example: `/muster @SomeUser ⏱️ "Arriving at 9:30 AM"` |
-| `/add_admin [@user]`                                       | Grants admin privileges to the mentioned user.                                                                                           |
+| `/leave add [user] <start> <end>`                         | Adds a leave period for the user.                                                                                              |
+| `/leave remove [user] <start>`                            | Removes a leave period for the  user that begins on the specified start date.                                                   |
+| `/muster [user] <emoji> [details]`                        | Checks in on behalf of another user. Details are required for statuses like ⏱️. Example: `/muster +11234567890 ⏱️ "Arriving at 9:30 AM"` |
+| `/add_admin [user]`                                       | Grants admin privileges to the user.                                                                                           |
+| `/get_members`                                       | Retrieves user info so admins can add leave, etc.                                                                                           |
 | `/post_checkin`                                            | Manually posts the daily check-in message to the group.                                                                                  |
+| `/post_reminder`                                            | Manually posts the daily reminder to the group.                                                                                    |
 | `/post_summary`                                            | Manually posts the daily status summary to the group.                                                                                    |
 
 ## License

@@ -1,14 +1,18 @@
 import asyncio
 import logging
 import os
-import pytz
 import sqlite3
-from datetime import datetime, timedelta, date
+from cron_converter import Cron
+from datetime import datetime, date
 from signal_bot_framework import create, AccountNumber, SignalBot
-from signal_bot_framework.aliases import Context, DataMessage
-from signal_bot_framework.args import QuoteMessageArgs, SendMessageArgs
+from signal_bot_framework.aliases import Context, DataMessage, CronCb, AccountUUID
+from signal_bot_framework.args import ListContactArgs
+from slack_bolt.async_app import AsyncApp
+from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
-
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
+SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
+TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID")
 CHAT_ID = os.environ.get("CHAT_ID")
 MUSTERBOT_ID = os.environ.get("MUSTERBOT_ID")
 DATABASE_FILE = os.environ.get("DATABASE_FILE")
@@ -25,16 +29,13 @@ STATUS_MAP = {
     "❓": {"text": "Other", "prompt": "Please provide your status for the day.", "hint": "question mark"}
 }
 
-daily_callback = None
-reminder_callback = None
-summary_callback = None
-
 daily_message_ts = {}
 update_status_ts = {}
+slack_app = None
 
 # -- Database Setup ---
 def db_connect():
-    return sqlite3.connect(DATABASE_FILE)
+    return sqlite3.connect(DATABASE_FILE) # type: ignore
 
 def setup_database():
     """Initializes the SQLite database and creates tables if they don't exist."""
@@ -59,6 +60,12 @@ def setup_database():
         )
     ''')
     cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tdy (
+            id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL, description TEXT NOT NULL 
+        )
+    ''')
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS holidays (
             holiday_date TEXT PRIMARY KEY, description TEXT NOT NULL
         )
@@ -74,9 +81,9 @@ def setup_database():
         )
     ''')
     # Seed initial data if tables are empty
-    cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('checkin_time', '08:00')")
-    cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('reminder_time', '10:00')")
-    cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('summary_time', '11:00')")
+    cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('checkin_time', '06:00')")
+    cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('reminder_time', '09:00')")
+    cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('summary_time', '10:00')")
     # Add the reporting user as the first admin
     if REPORTING_USER_ID:
         cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (REPORTING_USER_ID,))
@@ -107,7 +114,7 @@ def is_workday(check_date):
 
 def is_user_on_leave(user_id, check_date):
     """Checks if a user is on leave on a specific date."""
-    conn = sqlite3.connect(DATABASE_FILE)
+    conn = db_connect()
     cursor = conn.cursor()
     cursor.execute("SELECT start_date, end_date FROM leave WHERE user_id = ?", (user_id,))
     leave_periods = cursor.fetchall()
@@ -120,49 +127,120 @@ def is_user_on_leave(user_id, check_date):
             return True
     return False
 
+def get_user_tdy_status(user_id, check_date):
+    """Checks if a user is on TDY on a specific date and returns the description if they are."""
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT start_date, end_date, description FROM tdy WHERE user_id = ?", (user_id,))
+    tdy_periods = cursor.fetchall()
+    conn.close()
+
+    for start_str, end_str, description in tdy_periods:
+        start_date = date.fromisoformat(start_str)
+        end_date = date.fromisoformat(end_str)
+        if start_date <= check_date <= end_date:
+            return description  # Return the description of the TDY
+    return None
+
+async def get_username_from_userid(signal: SignalBot, user_id: AccountUUID):
+    user_info_task = await signal.list_contacts(args=ListContactArgs(recipient=user_id)) # type: ignore
+    user_info_object = await user_info_task
+    user_info = user_info_object.result[0]
+    givenName = user_info['profile']['givenName'] if user_info['profile']['givenName'] else ''
+    familyName = user_info['profile']['familyName'] if user_info['profile']['familyName'] else ''
+    return f"{givenName} {familyName}"
+
+def add_cron_while_running(signal: SignalBot, cron_hook: CronCb):
+    loop = asyncio.get_running_loop()
+    ref = datetime.now()
+    cron_str, _ = cron_hook # type: ignore
+    cron = Cron(cron_str)
+    schedule = cron.schedule(ref)
+    next_schedule = schedule.next()
+    delay = (next_schedule - ref).total_seconds()
+    signal._crons.append(loop.call_later(delay, signal._cron_repeat, signal, schedule, cron_hook)) # type: ignore
+
+async def get_all_users(signal: SignalBot):
+    group_info_task = await signal.get_group_info(CHAT_ID) # type: ignore
+    group_info_response = await group_info_task
+    group_info = group_info_response.result[0]
+    all_users = [member for member in group_info['members']] # type: ignore
+    return all_users
+
+# --- Cron Callbacks ---
 async def post_daily_checkin_callback(signal: SignalBot):
     """Posts the daily check-in message to the target Signal group."""
-    # Send the message and store its timestamp
-    today_str = date.today().strftime("%Y-%m-%d")
+    today = date.today()
+    if not is_workday(today):
+        logging.info("Not a workday, no check-in") 
+        return
+
+    logging.info("In post_daily_checkin")
+    today_str = today.strftime("%Y-%m-%d")
     instructions = "\n".join(f"{emoji} (search '{status['hint']}') - {status['text']}" for emoji, status in STATUS_MAP.items())
-    message = f"*Good morning! Please check in for {today_str} by reacting to this message.* ☀️\n\n{instructions}"
-    response_task = await signal.send_message(CHAT_ID, message)
+    message = f"☀️ Good morning! Please check in for {today_str} by reacting to this message. \n\n{instructions}"
+    response_task = await signal.send_message(CHAT_ID, message) # type: ignore
     response_object = await response_task
     the_result = response_object.result
     daily_message_ts[the_result['timestamp']] = today_str
+    logging.info(signal._crons) # type: ignore
 
 async def post_daily_summary_callback(signal: SignalBot):
     today = date.today()
-    if not is_workday(today): return
+    if not is_workday(today): 
+        logging.info("Not a workday, no summary")
+        return
 
+    logging.info("post_daily_summary_callback")
     today_str = today.strftime("%Y-%m-%d")
-    conn = db_connect()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, response_text, details FROM responses WHERE response_date = ?", (today_str,))
-    responses = cursor.fetchall()
-    conn.close()
-
-    if not responses:
-        summary_text = f"*Daily Status Summary for {today_str}*\n\nNo one has checked in yet."
-    else:
-        summary_text = f"*Daily Status Summary for {today_str}*\n"
-        for user_id, response, details in responses:
-            details_text = f" ({details})" if details else ""
-            summary_text += f"\n• <@{user_id}>: *{response}*{details_text}"
+    summary_text = f"*Daily Status Summary for {today_str}*\n"
     try:
-        signal.send_message(CHAT_ID, summary_text)
+        group_info_task = await signal.get_group_info(CHAT_ID) # type: ignore
+        group_info_response = await group_info_task
+        group_info = group_info_response.result[0]
+        all_users = [member['uuid'] for member in group_info['members'] if member['number'] != MUSTERBOT_ID] # type: ignore
+        
+        conn = db_connect()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, response_text, details FROM responses WHERE response_date = ?", (today_str,))
+        responses = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+        conn.close()
+
+        for user_id in all_users:
+            tdy_status = get_user_tdy_status(user_id, today)
+            if tdy_status:
+                status_line = f"✈️ *{tdy_status}*"
+            elif is_user_on_leave(user_id, today):
+                status_line = f"🌴 On Leave"
+            elif user_id in responses:
+                response, details = responses[user_id]
+                details_text = f" ({details})" if details else ""
+                status_line = f"{response} {details_text}"
+            else:
+                status_line = "❌ Not Checked In"
+            user_name = await get_username_from_userid(signal, user_id)
+            summary_text += f"\n• {user_name}: {status_line}"
+
+        await signal.send_message(CHAT_ID, summary_text) # type: ignore
+        await slack_app.client.chat_postMessage(channel=TARGET_CHANNEL_ID, text=summary_text) # type: ignore
         logging.info("Posted daily summary.")
     except Exception as e:
         logging.error(f"Failed to post daily summary: {e}")
 
-async def post_reminder_callback(signal: SignalBot) -> bool:
+async def post_reminder_callback(signal: SignalBot) -> None:
     today = date.today()
-    if not is_workday(today): return True
+    if not is_workday(today): 
+        logging.info("Not a workday, no reminder")
+        return 
+    
+    logging.info("In post_reminder_callback")
     today_str = today.strftime("%Y-%m-%d")
 
     # Get all users in the group
-    group_info = await signal.get_group(CHAT_ID)
-    all_users = [member['number'] for member in group_info['members']]
+    group_info_task = await signal.get_group_info(CHAT_ID) # type: ignore
+    group_info_response = await group_info_task
+    group_info = group_info_response.result[0]
+    all_users = [member['uuid'] for member in group_info['members']] # type: ignore
     
     # Get users who have responded
     conn = db_connect()
@@ -177,74 +255,8 @@ async def post_reminder_callback(signal: SignalBot) -> bool:
             await signal.send_message(user_id, "Just a friendly reminder to please check in for today. ☀️")
 
     logging.info("Sent reminders.")
-    return True
 
-async def message_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
-    """ This callback handles all messages (not prefix or cron callbacks) """
-    # first check to see if this is in the main group or it's a dm
-    if context[1] == CHAT_ID:
-        # it's in the main thread.  The only things that should be here are reactions.
-        if message.reaction and not message.reaction["isRemove"] and message.reaction["targetSentTimestamp"] in daily_message_ts:
-            await react_callback(signal, context, message)
-    # if it's not in the main chat, it should be a dm. Check to see if it's an update response.
-    elif context[1] in update_status_ts:
-        await update_status_callback(signal, context, message)
-    # log all messages that are sent 
-    try:
-        if message.message:
-            conn = db_connect()
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO messages (sender_id, sender_name, destination_id, sent_timestamp, message) VALUES (?, ?, ?, ?, ?)",
-                (message.sender, message.sender_name, context[1], message.timestamp, message.message)
-            )
-            conn.commit()
-            conn.close()
-    except Exception as e:
-        logging.error(f"Error handling response: {e}")
-    
-async def react_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
-    today_str = daily_message_ts.get(message.reaction["targetSentTimestamp"])
-    if not today_str:
-        return False # Not a reaction to a check-in message
-
-    emoji = message.reaction["emoji"]
-    status_info = STATUS_MAP.get(emoji)
-
-    if not status_info:
-        # Invalid emoji reaction
-        await signal.send_message(message.sender, f"I don't understand the '{emoji}' emoji. Please react with one of the emojis from the daily check-in message.")
-        return True
-
-    status = status_info["text"]
-    response_message = status_info.get("prompt")
-    details = None
-
-     # DM for more information if needed
-    if response_message:
-        response_task = await signal.send_message(message.sender, response_message)
-        response_object = await response_task
-        the_result = response_object.result
-        # Store the user_id and the status for which we are awaiting details
-        update_status_ts[message.sender] = {"timestamp": the_result['timestamp'], "status": status, "response_date": today_str}
-    else:
-        # If no more info is needed, save directly to the database
-        try:
-            conn = db_connect()
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO responses (user_id, user_name, response_date, response_text, details) VALUES (?, ?, ?, ?, ?)",
-                (message.sender, message.sender_name, today_str, status, details)
-            )
-            conn.commit()
-            conn.close()
-            # Acknowledge the check-in
-            await signal.send_message(message.sender, f"Thanks for checking in! I've marked you as '{status}' for {today_str}.")
-        except Exception as e:
-            logging.error(f"Error handling response: {e}")
-
-    return True
-
+# --- Prefix Callbacks ---
 async def help_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
     # Ensure this is a DM
     if context[1] != message.sender:
@@ -253,55 +265,35 @@ async def help_callback(signal: SignalBot, context: Context, message: DataMessag
     help_text = "*MusterBot Commands*\n\n"
     help_text += "*/help* - Show this help message\n"
     help_text += "*/status [date]* - Check your status for a given date (e.g., /status 2024-10-27). Defaults to today.\n"
+    help_text += "*/leave [add/remove] [start_date YYYY-MM-DD] [end_date YYYY-MM-DD]* - Add or remove leave.\n"
+    help_text += "*/tdy [add/remove] [start_date YYYY-MM-DD] [end_date YYYY-MM-DD]* - Add or remove tdy/training.\n"
     if is_admin(message.sender):
         help_text += "\n*Admin Commands*\n"
         help_text += "*/config [key] [value]* - View or set a configuration value (e.g., /config checkin_time 08:30)\n"
         help_text += "*/holiday [add/remove] [YYYY-MM-DD] [description]* - Add or remove a holiday.\n"
-        help_text += "*/leave [add/remove] [@user] [start_date] [end_date]* - Add or remove leave for a user.\n"
         help_text += "*/add_admin [@user]* - Add a new admin.\n"
+        help_text += "*/status [user] [date]* - Check a user's status\n"
+        help_text += "*/get_members* - Get the members of the group\n"
         help_text += "*/post_checkin* - Manually post the daily check-in message.\n"
         help_text += "*/post_summary* - Manually post the daily summary.\n"
 
-    await signal.send_message(message.sender, help_text)
+    await signal.send_message(message.sender, help_text) # type: ignore
     return True
 
 async def ping_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    return True
     pass
-
-async def update_status_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
-    # Check if this is a reply to a request for more information
-    if message.sender in update_status_ts and message.quote is not None and update_status_ts[message.sender]["timestamp"] == message.quote["id"]:
-        status_update_info = update_status_ts.pop(message.sender)
-        status = status_update_info["status"]
-        response_date = status_update_info["response_date"]
-        details = message.message
-
-        try:
-            conn = db_connect()
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT OR REPLACE INTO responses (user_id, user_name, response_date, response_text, details) VALUES (?, ?, ?, ?, ?)",
-                (message.sender, message.sender_name, response_date, status, details)
-            )
-            conn.commit()
-            conn.close()
-            # Confirm the update with the user
-            await signal.send_message(message.sender, f"Got it! Your status has been updated to '{status}' with the details: '{details}'.")
-        except Exception as e:
-            logging.error(f"Error updating status: {e}")
-        return True
-    return False
 
 async def add_holiday_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
     """Callback to add or remove a holiday from the database."""
     # Admin and DM only
-    if not is_admin(message.sender) or context[1] != message.sender:
+    if not is_admin(message.sender_uuid) or context[1] != message.sender:
         return False
 
-    parts = message.message.split(maxsplit=3)
+    parts = message.message.split(maxsplit=3) # type: ignore
     # Expected format: /holiday <add|remove> <YYYY-MM-DD> [description]
     if len(parts) < 3:
-        await signal.send_message(message.sender, "Usage:\n/holiday add YYYY-MM-DD Description\n/holiday remove YYYY-MM-DD")
+        await signal.send_message(message.sender_uuid, "Usage:\n/holiday add YYYY-MM-DD Description\n/holiday remove YYYY-MM-DD") # type: ignore
         return True
 
     _, action, holiday_date_str = parts[:3]
@@ -311,7 +303,7 @@ async def add_holiday_callback(signal: SignalBot, context: Context, message: Dat
         # Validate date format
         date.fromisoformat(holiday_date_str)
     except ValueError:
-        await signal.send_message(message.sender, "Invalid date format. Please use YYYY-MM-DD.")
+        await signal.send_message(message.sender_uuid, "Invalid date format. Please use YYYY-MM-DD.") # type: ignore
         return True
 
     conn = db_connect()
@@ -319,16 +311,16 @@ async def add_holiday_callback(signal: SignalBot, context: Context, message: Dat
 
     if action.lower() == 'add':
         if not description:
-            await signal.send_message(message.sender, "A description is required to add a holiday.")
+            await signal.send_message(message.sender_uuid, "A description is required to add a holiday.") # type: ignore
             conn.close()
             return True
         cursor.execute("INSERT OR REPLACE INTO holidays (holiday_date, description) VALUES (?, ?)", (holiday_date_str, description))
-        await signal.send_message(message.sender, f"Holiday '{description}' on {holiday_date_str} has been added. 🥳")
+        await signal.send_message(message.sender_uuid, f"Holiday '{description}' on {holiday_date_str} has been added. 🥳") # type: ignore
     elif action.lower() == 'remove':
         cursor.execute("DELETE FROM holidays WHERE holiday_date = ?", (holiday_date_str,))
-        await signal.send_message(message.sender, f"Holiday on {holiday_date_str} has been removed.")
+        await signal.send_message(message.sender_uuid, f"Holiday on {holiday_date_str} has been removed.") # type: ignore
     else:
-        await signal.send_message(message.sender, f"Unknown action '{action}'. Please use 'add' or 'remove'.")
+        await signal.send_message(message.sender_uuid, f"Unknown action '{action}'. Please use 'add' or 'remove'.") # type: ignore
 
     conn.commit()
     conn.close()
@@ -336,10 +328,10 @@ async def add_holiday_callback(signal: SignalBot, context: Context, message: Dat
 
 async def update_config_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
     # Admin and DM only
-    if not is_admin(message.sender) or context[1] != message.sender:
+    if not is_admin(message.sender_uuid) or context[1] != message.sender:
         return False
 
-    parts = message.message.split()
+    parts = message.message.split() # type: ignore
     if len(parts) == 1: # /config
         conn = db_connect()
         cursor = conn.cursor()
@@ -349,7 +341,7 @@ async def update_config_callback(signal: SignalBot, context: Context, message: D
         config_text = "*Current Configuration*\n"
         for key, value in configs:
             config_text += f"\n• {key}: {value}"
-        await signal.send_message(message.sender, config_text)
+        await signal.send_message(message.sender_uuid, config_text) # type: ignore
 
     elif len(parts) == 3: # /config key value
         _, key, value = parts
@@ -358,25 +350,29 @@ async def update_config_callback(signal: SignalBot, context: Context, message: D
         cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
         conn.commit()
         conn.close()
-        await signal.send_message(message.sender, f"Configuration updated: {key} = {value}")
+        await signal.send_message(message.sender_uuid, f"Configuration updated: {key} = {value}") # type: ignore
         # Regenerate cron callbacks with the new times
-        await generate_cron_callbacks(signal, context, message)
+        await generate_cron_callbacks(signal)
     else:
-        await signal.send_message(message.sender, "Usage: /config [key] [value]")
+        await signal.send_message(message.sender_uuid, "Usage: /config [key] [value]") # type: ignore
         
     return True
 
 async def add_admin_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
     """Callback to add a new admin."""
     # Admin and DM only
-    if not is_admin(message.sender) or context[1] != message.sender:
+    if not is_admin(message.sender_uuid) or context[1] != message.sender:
         return False
 
-    if not message.mentions:
-        await signal.send_message(message.sender, "Usage: /add_admin [@user]")
+    parts = message.message.split() # type: ignore
+    
+    if len(parts) != 2:
+        await signal.send_message(message.sender, "Usage: /add_admin [user]") # type: ignore
         return True
 
-    new_admin_id = message.mentions[0]['number']
+    new_admin_id = parts[1]
+
+    # make sure this id actually exists on the signal servers
     
     conn = db_connect()
     cursor = conn.cursor()
@@ -384,58 +380,295 @@ async def add_admin_callback(signal: SignalBot, context: Context, message: DataM
     conn.commit()
     conn.close()
 
-    await signal.send_message(message.sender, f"<@{new_admin_id}> has been added as an admin. 🛡️")
+    await signal.send_message(message.sender_uuid, f"<@{new_admin_id}> has been added as an admin. 🛡️") # type: ignore
     return True
 
 async def leave_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
     """Callback to add or remove leave for a user."""
-    # Admin and DM only
-    if not is_admin(message.sender) or context[1] != message.sender:
+    # DM only
+    if context[1] != message.sender:
         return False
 
-    parts = message.message.split()
-    # Expected format: /leave <add|remove> @user <start_date> <end_date>
-    if len(parts) < 4 or not message.mentions:
-        await signal.send_message(message.sender, "Usage: /leave [add/remove] [@user] [start_date] [end_date]")
-        return True
+    action = ""
+    parts = message.message.split() # type: ignore
+    sender_is_admin = is_admin(message.sender_uuid)
+    target_user_id = None
+    start_date_str = None
+    end_date_str = None
 
-    action = parts[1]
-    user_id = message.mentions[0]['number'] # Get the phone number from the first mention
-    user_name = message.mentions[0]['name']
-    start_date_str = parts[2] if action == 'remove' else parts[3]
-    end_date_str = parts[3] if action == 'remove' else parts[4] if len(parts) > 4 else start_date_str # End date is optional, defaults to start date
+    if sender_is_admin and len(parts) >= 4:
+        target_user_id = parts[2]
+        action = parts[1]
+        start_date_str = parts[3]
+        end_date_str = parts[4] if len(parts) > 4 else start_date_str
+    if not target_user_id and len(parts) >= 3:
+        target_user_id = message.sender_uuid
+        action = parts[1]
+        start_date_str = parts[2]
+        end_date_str = parts[3] if len(parts) > 3 else start_date_str
+    if not target_user_id:
+        usage = "Usage: /leave <add|remove> <start_date YYYY-MM-DD> [end_date YYYY-MM-DD]\n"
+        if sender_is_admin:
+            usage += "Admin Usage:\n"
+            usage += "  /leave [add|remove] [+123456789] [start] [end]"
+        await signal.send_message(message.sender_uuid, usage)
+        return True
+    user_name = await get_username_from_userid(signal, target_user_id) # type: ignore
 
     try:
-        date.fromisoformat(start_date_str)
-        date.fromisoformat(end_date_str)
+        date.fromisoformat(start_date_str) # type: ignore
+        date.fromisoformat(end_date_str) # type: ignore
     except ValueError:
-        await signal.send_message(message.sender, "Invalid date format. Please use YYYY-MM-DD.")
+        await signal.send_message(message.sender_uuid, "Invalid date format. Please use YYYY-MM-DD.") # type: ignore
         return True
 
     conn = db_connect()
     cursor = conn.cursor()
 
     if action.lower() == 'add':
-        cursor.execute("INSERT INTO leave (user_id, user_name, start_date, end_date) VALUES (?, ?, ?, ?)", (user_id, user_name, start_date_str, end_date_str))
-        await signal.send_message(message.sender, f"Leave has been added for <@{user_id}> from {start_date_str} to {end_date_str}. 🌴")
+        cursor.execute("INSERT INTO leave (user_id, user_name, start_date, end_date) VALUES (?, ?, ?, ?)", (target_user_id, user_name, start_date_str, end_date_str))
+        await signal.send_message(message.sender_uuid, f"Leave has been added for {user_name} from {start_date_str} to {end_date_str}. 🌴") # type: ignore
     elif action.lower() == 'remove':
         # This will remove all leave entries for the user that start on the specified date.
-        cursor.execute("DELETE FROM leave WHERE user_id = ? AND start_date = ?", (user_id, start_date_str))
-        await signal.send_message(message.sender, f"Leave starting on {start_date_str} for <@{user_id}> has been removed.")
+        cursor.execute("DELETE FROM leave WHERE user_id = ? AND start_date = ?", (target_user_id, start_date_str))
+        await signal.send_message(message.sender_uuid, f"Leave starting on {start_date_str} for {user_name} has been removed.") # type: ignore
     else:
-        await signal.send_message(message.sender, f"Unknown action '{action}'. Please use 'add' or 'remove'.")
+        await signal.send_message(message.sender_uuid, f"Unknown action '{action}'. Please use 'add' or 'remove'.") # type: ignore
 
     conn.commit()
     conn.close()
     return True
 
-async def generate_cron_callbacks(signal: SignalBot, context: Context, message: DataMessage) -> bool:
-    global daily_callback, reminder_callback, summary_callback
+async def tdy_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    """Callback for users to log their own travel, training, or other temporary duty."""
+    # Command must be sent in a DM
+    if context[1] != message.sender:
+        return False
+
+    parts = message.message.split(maxsplit=3) # type: ignore
+    # Expected format: /tdy <start_date> <end_date> <description>
+    if len(parts) < 4:
+        await signal.send_message(message.sender, "Usage: /tdy [add|remove] [start_date] [end_date] [description of travel/training]") # type: ignore
+        return True
+
+    _, start_date_str, end_date_str, description = parts
+
+    try:
+        start = date.fromisoformat(start_date_str)
+        end = date.fromisoformat(end_date_str)
+        if start > end:
+            await signal.send_message(message.sender, "The start date cannot be after the end date.") # type: ignore
+            return True
+    except ValueError:
+        await signal.send_message(message.sender, "Invalid date format. Please use YYYY-MM-DD.") # type: ignore
+        return True
+
+    conn = db_connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO tdy (user_id, start_date, end_date, description) VALUES (?, ?, ?, ?)",
+        (message.sender_uuid, start_date_str, end_date_str, description)
+    )
+    conn.commit()
+    conn.close()
+
+    await signal.send_message(message.sender, f"Got it. I've logged your status as '{description}' from {start_date_str} to {end_date_str}. ✈️") # type: ignore
+    return True
+
+async def get_members_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    # Admin and DM only
+    if not is_admin(message.sender_uuid) or context[1] != message.sender:
+        return False
+    all_users = await get_all_users(signal)
+    output = f""
+    for user in all_users:
+        username = await get_username_from_userid(signal, user['uuid'])
+        output += f"{username}: {user['number']}\n"
+    output += f"\n"
+    await signal.send_message(message.sender_uuid, output) 
+    return True
+
+async def status_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    """Callback to retrieve status for a user."""
+    # DM only
+    if context[1] != message.sender:
+        return False
+
+    parts = message.message.split() # type: ignore
+    sender_is_admin = is_admin(message.sender_uuid)
+    target_user_id = None
+    target_date = None
+
+    if sender_is_admin and len(parts) == 3:
+        target_date = parts[2]
+        target_user_id = parts[1]
+    if not target_user_id and len(parts) == 2:
+        target_user_id = message.sender_uuid
+        target_date = parts[1]
+    if not target_user_id and len(parts) == 1:
+        target_user_id = message.sender_uuid
+        target_date = date.today().strftime("%Y-%m-%d")
+    if not target_user_id:
+        usage =  "Usage: /status [date]\n"
+        usage += "  (Note: date should be in YYYY-MM-DD format)\n"
+        if sender_is_admin:
+            usage += "Admin Usage:\n"
+            usage += "  /status [user] [date]\n"
+            usage += "  (Note: user should be in '+15551234567' format)"
+        await signal.send_message(message.sender_uuid, usage)
+        return True
     
-    # Remove previous cron jobs
-    if daily_callback: signal.remove_cron(daily_callback)
-    if reminder_callback: signal.remove_cron(reminder_callback)
-    if summary_callback: signal.remove_cron(summary_callback)
+    user_name = await get_username_from_userid(signal, target_user_id) # type: ignore
+
+    try:
+        date.fromisoformat(target_date) # type: ignore
+    except ValueError:
+        await signal.send_message(message.sender_uuid, "Invalid date format. Please use YYYY-MM-DD.") # type: ignore
+        return True
+
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT user_id, user_name, response_date, response_text, details FROM responses WHERE user_id = ? AND response_date = ?", (target_user_id, target_date))
+    responses = cursor.fetchall()
+    conn.close()
+    output = f""
+    for _, user_name, _, text, details in responses:
+        output += f"{user_name}: {text} ({details})\n"
+    await signal.send_message(message.sender_uuid, output)
+    return True
+
+# --- Message Callbacks ---
+async def message_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    """ This callback handles all messages (not prefix or cron callbacks) """
+    print(message.sender_uuid)
+    print(update_status_ts)
+    # first check to see if this is in the main group or it's a dm
+    if context[1] == CHAT_ID:
+        # it's in the main thread.  The only things that should be here are reactions.
+        if message.reaction and not message.reaction["isRemove"] and message.reaction["targetSentTimestamp"] in daily_message_ts:
+            await react_callback(signal, context, message)
+    # if it's not in the main chat, it should be a dm. Check to see if it's an update response.
+    elif message.sender_uuid in update_status_ts:
+        await update_status_callback(signal, context, message)
+    # log all messages that are sent 
+    try:
+        if message.message:
+            conn = db_connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO messages (sender_id, sender_name, destination_id, sent_timestamp, message) VALUES (?, ?, ?, ?, ?)",
+                (message.sender_uuid, message.sender_name, context[1], message.timestamp, message.message)
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logging.error(f"Error handling response: {e}")
+        return False
+    return True
+    
+async def react_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    today_str = daily_message_ts.get(message.reaction["targetSentTimestamp"]) # type: ignore
+    if not today_str:
+        return False # Not a reaction to a check-in message
+
+    emoji = message.reaction["emoji"] # type: ignore
+    status_info = STATUS_MAP.get(emoji)
+
+    if not status_info:
+        # Invalid emoji reaction
+        await signal.send_message(message.sender_uuid, f"I don't understand the '{emoji}' emoji. Please react with one of the emojis from the daily check-in message.") # type: ignore
+        return True
+
+    status = status_info["text"]
+    response_message = status_info.get("prompt")
+    details = None
+
+     # DM for more information if needed
+    if response_message:
+        print(message.sender_uuid)
+        response_task = await signal.send_message(message.sender, response_message) # type: ignore
+        response_object = await response_task
+        the_result = response_object.result
+        # Store the user_id and the status for which we are awaiting details
+        update_status_ts[message.sender_uuid] = {"timestamp": the_result['timestamp'], "status": status, "response_date": today_str}
+    else:
+        # If no more info is needed, save directly to the database
+        try:
+            conn = db_connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO responses (user_id, user_name, response_date, response_text, details) VALUES (?, ?, ?, ?, ?)",
+                (message.sender_uuid, message.sender_name, today_str, status, details)
+            )
+            conn.commit()
+            conn.close()
+            # Acknowledge the check-in
+            await signal.send_message(message.sender_uuid, f"Thanks for checking in! I've marked you as '{status}' for {today_str}.") # type: ignore
+        except Exception as e:
+            logging.error(f"Error handling response: {e}")
+
+    return True
+
+async def update_status_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool: 
+    # Check if this is a reply to a request for more information
+    status_update_info = update_status_ts.pop(message.sender_uuid)
+    status = status_update_info["status"]
+    response_date = status_update_info["response_date"]
+    details = message.message
+
+    try:
+        conn = db_connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO responses (user_id, user_name, response_date, response_text, details) VALUES (?, ?, ?, ?, ?)",
+            (message.sender_uuid, message.sender_name, response_date, status, details)
+        )
+        conn.commit()
+        conn.close()
+        # Confirm the update with the user
+        await signal.send_message(message.sender_uuid, f"Got it! Your status has been updated to '{status}' with the details: '{details}'.") # type: ignore
+    except Exception as e:
+        logging.error(f"Error updating status: {e}")
+    return True
+
+# --- Test Callbacks ---
+async def test_group_info_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    # Admin and DM only
+    if not is_admin(message.sender_uuid) or context[1] != message.sender:
+        return False
+    group_info_task = await signal.get_group_info(CHAT_ID) # type: ignore
+    group_info = await group_info_task
+    print(group_info.result)
+    #all_users = [member['number'] for member in group_info['members']] # type: ignore
+    #print(all_users)
+    return True
+
+async def test_post_daily_checkin_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    # Admin and DM only
+    if not is_admin(message.sender_uuid) or context[1] != message.sender:
+        return False
+    await post_daily_checkin_callback(signal)
+    return True
+
+async def test_post_reminder_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    # Admin and DM only
+    if not is_admin(message.sender_uuid) or context[1] != message.sender:
+        return False
+    await post_reminder_callback(signal)
+    return True
+
+async def test_post_daily_summary_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    # Admin and DM only
+    if not is_admin(message.sender_uuid) or context[1] != message.sender:
+        return False
+    await post_daily_summary_callback(signal)
+    return True
+
+# --- Deprecated Functions ---
+async def generate_cron_callbacks(signal: SignalBot) -> None:
+    # Stop all the currently sleeping jobs
+    signal.stop_crons() # type: ignore
 
     # Get times from DB
     conn = db_connect()
@@ -444,85 +677,75 @@ async def generate_cron_callbacks(signal: SignalBot, context: Context, message: 
     configs = dict(cursor.fetchall())
     conn.close()
 
-    local_tz_name = configs.get('timezone', 'UTC') # Default to UTC if not set
-    try:
-        local_tz = pytz.timezone(local_tz_name)
-    except pytz.UnknownTimeZoneError:
-        logging.error(f"Unknown timezone in config: {local_tz_name}. Defaulting to UTC.")
-        local_tz = pytz.utc
-
     cron_jobs = {
-        'checkin': configs.get('checkin_time', '08:00'),
-        'reminder': configs.get('reminder_time', '10:00'),
-        'summary': configs.get('summary_time', '11:00')
+        'checkin': configs.get('checkin_time', '06:00'),
+        'reminder': configs.get('reminder_time', '09:00'),
+        'summary': configs.get('summary_time', '10:00')
     }
-
-    utc_now = datetime.now(pytz.utc)
     
     for job_name, local_time_str in cron_jobs.items():
         local_hour, local_minute = map(int, local_time_str.split(':'))
         
-        # Create a datetime object for today in the local timezone with the specified time
-        local_dt = local_tz.localize(datetime.now()).replace(hour=local_hour, minute=local_minute, second=0, microsecond=0)
-        
-        # Convert the localized datetime to UTC
-        utc_dt = local_dt.astimezone(pytz.utc)
-        
-        utc_hour = utc_dt.hour
-        utc_minute = utc_dt.minute
-        
-        cron_string = f"{utc_minute} {utc_hour} * * 1-5" # Run Monday to Friday
-        
+        cron_string = f"{local_minute} {local_hour} * * 1-5" # Run Monday to Friday
         if job_name == 'checkin':
-            daily_callback = signal.on_cron(cron_string, post_daily_checkin_callback)
-            logging.info(f"Scheduled daily check-in: {cron_string} (UTC)")
+            add_cron_while_running(signal, (cron_string, post_daily_checkin_callback)) # type: ignore
+            logging.info(f"Scheduled daily check-in: {cron_string}")
         elif job_name == 'reminder':
-            reminder_callback = signal.on_cron(cron_string, post_reminder_callback)
-            logging.info(f"Scheduled reminder: {cron_string} (UTC)")
+            add_cron_while_running(signal, (cron_string, post_reminder_callback)) # type: ignore
+            logging.info(f"Scheduled reminder: {cron_string}")
         elif job_name == 'summary':
-            summary_callback = signal.on_cron(cron_string, post_daily_summary_callback)
-            logging.info(f"Scheduled summary: {cron_string} (UTC)")
-            
+            add_cron_while_running(signal, (cron_string, post_daily_summary_callback)) # type: ignore
+            logging.info(f"Scheduled summary: {cron_string}")
+
+async def test_generate_cron_callback(signal: SignalBot, context: Context, message: DataMessage) -> bool:
+    await generate_cron_callbacks(signal)
     return True
 
 async def main():
     """Entrypoint"""
-
+    global slack_app
     setup_database()
 
     # Create our Signal-Bot
-    signal = await create(AccountNumber(MUSTERBOT_ID))
+    signal = await create(AccountNumber(MUSTERBOT_ID)) # type: ignore
 
-    # Register a callback for messages beginning with "/help"
+    # Create our Slack-Bot
+    slack_app = AsyncApp(token=SLACK_BOT_TOKEN)
+    slack_handler = AsyncSocketModeHandler(slack_app, SLACK_APP_TOKEN)
+
+    # Register prefix callbacks
     signal.on_prefix("/help", help_callback)
-   
-    # Register a callback for messages beginning with "/holiday"
+    signal.on_prefix("/leave", leave_callback)   
+    signal.on_prefix('/tdy', tdy_callback)
     signal.on_prefix("/holiday", add_holiday_callback)
-
-    # Register a callback for messages beginning with "/add_admin"
     signal.on_prefix("/add_admin", add_admin_callback)
-
-    # Regsister a callback for messgaes beginning with "/leave"
-    signal.on_prefix("/leave", leave_callback)
-    
-    # Register a callback for messages beginning with "/ping".
+    signal.on_prefix("/config", update_config_callback)
+    signal.on_prefix("/get_members", get_members_callback)
     signal.on_prefix('/ping', ping_callback)
     
-    # Register a callback to deal with all messages
+    # Register a callback to deal with messages
     signal.on_message(message_callback)
 
-    # Register a cron callback to generate the other cron callbacks each day
-    signal.on_cron("0 15 * * *", generate_cron_callbacks)
+    # Register cron callbacks
+    signal.on_cron("0 6 * * 1-5", post_daily_checkin_callback)
+    signal.on_cron("0 8 * * 1-5", post_reminder_callback)
+    signal.on_cron("0 10 * * 1-5", post_daily_summary_callback)
 
-    # Callback to change the configuration settings
-    signal.on_prefix("/config", update_config_callback)
-
-    signal.on_prefix("/post_checkin", post_daily_checkin_callback)
-
-    signal.on_prefix("/post_reminder", post_reminder_callback)
-
-    signal.on_prefix("/post_summary", post_daily_summary_callback)
+    # Register testing callbacks
+    signal.on_prefix("/test_group", test_group_info_callback)
+    signal.on_prefix("/post_checkin", test_post_daily_checkin_callback)
+    signal.on_prefix("/post_reminder", test_post_reminder_callback)
+    signal.on_prefix("/post_summary", test_post_daily_summary_callback)
+    logging.info("Starting Signal and Slack bots...")
+    await asyncio.gather(
+        signal.run(),
+        slack_handler.start_async()
+    )
     await signal.run()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    logging.basicConfig(level=logging.INFO)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Shutting down...")
